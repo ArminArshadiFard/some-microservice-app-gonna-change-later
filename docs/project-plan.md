@@ -1,135 +1,131 @@
-# Tech Stack
+# Project Plan
 
-This document records the technology choices for the event ticketing platform (users browse events and book tickets) and the reasoning behind each one. The assignment allows a "similar domain" to e-commerce; the five required service roles map as follows: Product = event-service, Order = booking-service, with User, Payment and Notification unchanged. It covers the "Tech Stack Selection" and "Database Design" requirements of Part 1. Day-to-day decisions that change over time go in `decisions.md`.
+Event ticketing platform: five microservices (user, event, booking, payment, notification).
 
-## 1. Summary
+Two-person team. Sprints = GitHub Milestones. Tasks = Issues with assignee.
+Estimates are indicative; rebalance at each planning.
 
-| Layer | Choice | Why (one line) |
-|---|---|---|
-| Language | Python 3.12 | One language across all services; fast to build and test |
-| API framework | Django 5 + Django REST Framework | Mature auth, ORM, migrations, admin; DRF gives serializers and viewsets |
-| API docs | drf-spectacular | Generates OpenAPI 3 + Swagger UI from the code, so docs never drift |
-| Auth | JWT via `djangorestframework-simplejwt` | Stateless, works across services without a shared session store |
-| Databases | PostgreSQL 16 (one database per service) | Relational integrity for users, bookings, payments |
-| Message broker | RabbitMQ | Simple, reliable queues; good fit for Booking -> Notification |
-| Async workers | Celery (+ Celery beat) | Consumes RabbitMQ events; runs the hold-expiry and reminder jobs |
-| Sync HTTP client | httpx | Timeouts, connection pooling, easy to mock in tests |
-| Retries | tenacity | Declarative retry with exponential backoff |
-| Circuit breaker | pybreaker | Python equivalent of Resilience4j |
-| Containers | Docker + Docker Compose | Local reproducible environment |
-| Orchestration | Kubernetes (Minikube) + nginx-ingress | Matches the assignment; path-based routing |
-| CI/CD | GitHub Actions + GHCR | Same place as the repo; free for this scale |
-| Metrics | Prometheus + django-prometheus | Per-service `/metrics/` with almost no code |
-| Dashboards | Grafana | Required screenshot deliverable |
-| Alerts | Prometheus alert rules + Alertmanager | Service-down and high-resource alerts |
-| Unit/integration tests | pytest + pytest-django | Fast, readable, good fixtures |
-| Load testing | k6 | Scriptable, simple results output |
-| Lint/format | ruff | One fast tool for lint and format |
-| Frontend (optional, not graded) | React + Vite | Thin UI only, capped at 6h |
+## Milestone overview
 
-## 2. Services and ownership of data
-
-Each service is self-contained and owns its own database. No service reads another service's tables.
-
-| Service | Responsibility | Database | Notes |
+| Sprint | Focus | Assignment parts covered | Exit criteria |
 |---|---|---|---|
-| user-service | Register, login, JWT issue, profile (attendee or organizer role) | `users_db` (PostgreSQL) | Passwords hashed with Django's PBKDF2 (or Argon2) |
-| event-service | Event and ticket-type CRUD, search, seat availability | `events_db` (PostgreSQL) | Search via indexed `ILIKE` / PostgreSQL full-text search; atomic seat holds |
-| booking-service | Create, track and cancel bookings; hold and expiry logic | `bookings_db` (PostgreSQL) | Statuses `HELD`, `PAID`, `EXPIRED`, `CANCELLED`; calls payment-service; publishes `booking.confirmed` |
-| payment-service | Simulated payments, failure simulation | `payments_db` (PostgreSQL) | Configurable failure rate for demos and tests |
-| notification-service | Consume events, send email (console) | `notifications_db` (PostgreSQL) | Booking confirmation and event reminders; logs sent notifications |
+| S0 (3 days) | Setup & skeleton | — (enables all) | `docker compose up` -> 5 `/health/` return 200, CI green |
+| S1 (week 1) | Design + User + Event | Part 1 (10%), start Part 2 | Design docs merged; register/login + event CRUD/search + seat hold working |
+| S2 (week 2) | Booking + Payment + Notification + fault tolerance | Part 2 (40%), Part 3 (15%) | Full booking flow works; circuit breaker and hold expiry demoable |
+| S3 (week 3) | Docker + K8s + CI/CD | Part 4 (20%), Part 5 (10%) | All services running on Minikube via ingress; images from GHCR |
+| S4 (week 4) | Monitoring + tests + report + demo | Part 5, Part 6 (5%) | Dashboard screenshot, k6 results, report PDF, demo video |
 
-### Database choice rationale
+## Role mapping (assignment -> this project)
 
-- **PostgreSQL everywhere** keeps operations simple: one engine to run in Compose and Kubernetes, one backup story, one set of skills.
-- Bookings, payments and seat counts need transactions and constraints, which favors SQL. Overselling is prevented in event-service with an atomic update (`UPDATE ... SET available = available - n WHERE available >= n`) or `SELECT ... FOR UPDATE` inside a transaction.
-- Event search is covered by PostgreSQL full-text search at this scale.
-- Deployment: **one PostgreSQL instance with five separate databases and five separate users**, each service holding credentials only for its own database. This keeps Minikube memory low while still enforcing data isolation. In production each service would get its own instance.
-- The assignment suggests MongoDB for the catalog service as an example only. We note it as a future improvement for events with flexible attributes (see section 10).
-
-## 3. Inter-service communication
-
-| Path | Style | Technology |
+| Assignment role | Our service | Main data |
 |---|---|---|
-| Client -> services | Synchronous REST | nginx-ingress, path-based routing (`/api/users`, `/api/events`, `/api/bookings`, ...) |
-| Booking -> Event | Synchronous REST | Hold seats before payment; release them on failure or expiry |
-| Booking -> Payment | Synchronous REST | httpx + tenacity retries + pybreaker circuit breaker |
-| Booking -> Notification | Asynchronous events | RabbitMQ queue (`booking.confirmed`), Celery consumer |
+| User Service | user-service | users, profiles |
+| Product Service | event-service | events, ticket types, seat availability |
+| Order Service | booking-service | bookings, status history |
+| Payment Service | payment-service | payments |
+| Notification Service | notification-service | sent notifications |
 
-Why this split: the seat hold and the payment result decide the booking status, so both are synchronous. Notification must never block or fail a booking, so it is asynchronous.
+## Tasks
 
-REST was chosen over gRPC because it is simpler to document with OpenAPI, easy to test with curl and Swagger UI, and sufficient for the traffic here.
+Owner: **A** = Armin, **B** = teammate. (Swap freely; keep both touching infra.)
 
-## 4. Fault tolerance
+### S0 — Setup (3 days)
+| # | Task | Owner | Est | Depends |
+|---|---|---|---|---|
+| S0-1 | Repo, collaborator, branch protection | A | 1h | — |
+| S0-2 | Scaffold + `docs/tech-stack.md`, `decisions.md`, `conventions.md` | A | 2h | S0-1 |
+| S0-3 | `docker-compose.yml` + Postgres init (5 DBs, 5 users) + RabbitMQ | A | 3h | S0-2 |
+| S0-4 | `user-service` full skeleton (health, Swagger, /metrics/, JWT config, Dockerfile) | A | 4h | S0-3 |
+| S0-5 | Copy skeleton -> event, booking, payment, notification services | B | 3h | S0-4 |
+| S0-6 | Minimal CI (ruff + pytest + docker build) | B | 3h | S0-5 |
+| S0-7 | Enable required status checks on `main` | A | 0.5h | S0-6 |
 
-- **Timeouts:** every outbound call has an explicit timeout (no default infinite waits).
-- **Retries:** tenacity, exponential backoff with jitter, limited attempts, only on transient errors (timeouts, 5xx), never on 4xx.
-- **Circuit breaker:** pybreaker on Booking -> Payment; opens after N consecutive failures, half-opens after a cool-down.
-- **Fallback:** when the circuit is open, the booking stays `HELD` and a clear "payment temporarily unavailable" response is returned. The seat hold expires after a fixed time (e.g. 10 minutes); a Celery beat task marks the booking `EXPIRED` and releases the seats in event-service, so no seats are lost to failures.
-- **Failure simulation:** payment-service exposes a configurable failure mode so the circuit breaker can be demonstrated on demand.
-- Note: Resilience4j is a Java library and Istio is a service mesh; tenacity + pybreaker is the equivalent at application level for Python.
+### S1 — Design + User + Event (week 1)
+| # | Task | Owner | Est | Depends |
+|---|---|---|---|---|
+| S1-1 | Architecture diagram (`docs/architecture.png`) | A | 3h | S0 |
+| S1-2 | API contracts per service (endpoint list -> OpenAPI), incl. seat hold/release endpoints | B | 4h | S0 |
+| S1-3 | DB schema per service (ERDs in docs) | B | 2h | S0 |
+| S1-4 | User service: models, register/login, profile, roles (attendee/organizer), tests | A | 8h | S0-4 |
+| S1-5 | Event service: event + ticket-type CRUD, search, atomic seat hold/release, tests | B | 9h | S0-5 |
+| S1-6 | Part 1 deliverable assembled (diagram + contracts + schemas) | A | 1h | S1-1..3 |
+| S1-7 | `docs/report-outline.md` started | B | 1h | S1-6 |
 
-## 5. Authentication and security
+### S2 — Booking + Payment + Notification + fault tolerance (week 2)
+| # | Task | Owner | Est | Depends |
+|---|---|---|---|---|
+| S2-1 | Payment service: process endpoint + failure simulation + unit tests | A | 6h | S1-4 |
+| S2-2 | Booking service: create/update/cancel, status flow `HELD`/`PAID`/`EXPIRED`/`CANCELLED`, calls to Event (hold) and Payment (httpx) | B | 7h | S2-1, S1-5 |
+| S2-3 | tenacity retries + pybreaker on Booking -> Payment + failure demo test | B | 4h | S2-2 |
+| S2-4 | Booking publishes `booking.confirmed` to RabbitMQ | B | 2h | S2-2 |
+| S2-5 | Notification: Celery worker, queue consumer, console email, tests | A | 8h | S0-3 |
+| S2-6 | Celery beat task: expire holds, release seats, send event reminders | A | 3h | S2-2, S2-5 |
+| S2-7 | Part 3 report (communication strategy) | A | 2h | S2-3, S2-5 |
+| S2-8 | Export OpenAPI YAMLs to `docs/openapi/` (CI step) | A | 1h | S1-4, S1-5 |
 
-- user-service issues short-lived JWT access tokens plus refresh tokens.
-- Other services validate tokens locally using the shared signing configuration (injected via Kubernetes Secret), so there is no call to user-service per request.
-- Secrets live in `.env` (git-ignored) locally and in Kubernetes Secrets in the cluster; `.env.example` is committed.
-- Passwords are never stored in plain text; input validation through DRF serializers.
-- Optional secret scanning in CI with gitleaks.
+### S3 — Docker + K8s + CI/CD (week 3)
+| # | Task | Owner | Est | Depends |
+|---|---|---|---|---|
+| S3-1 | Finalize Dockerfiles + compose healthchecks + env wiring | A | 2h | S2 |
+| S3-2 | K8s: namespace, ConfigMap, Secret, 5 Deployments + Services | B | 6h | S3-1 |
+| S3-3 | Postgres + RabbitMQ in K8s | B | 3h | S3-2 |
+| S3-4 | nginx-ingress, path-based routing, verify all services | B | 3h | S3-3 |
+| S3-5 | CI: test matrix -> build -> push to GHCR | A | 5h | S0-6 |
+| S3-6 | Optional deploy job (`kubectl apply`, manual trigger) | A | 3h | S3-5, S3-4 |
+| S3-7 | Demo video (Part 4) | Both | 2h | S3-4 |
+| S3-8 | `docs/demo-video-script.md` | A | 0.5h | — |
 
-## 6. Containerization and orchestration
+### S4 — Monitoring + tests + report (week 4)
+| # | Task | Owner | Est | Depends |
+|---|---|---|---|---|
+| S4-1 | django-prometheus `/metrics/` everywhere + `prometheus.yml` | A | 2h | S3-2 |
+| S4-2 | Grafana dashboard JSON + screenshot (Part 5 deliverable) | A | 3h | S4-1 |
+| S4-3 | Alertmanager rule (service down) + verify it fires | B | 2h | S4-1 |
+| S4-4 | k6 load test: many users competing for limited seats; assert no oversold seats | B | 4h | S3-4 |
+| S4-5 | Integration tests: booking -> payment -> notification | B | 3h | S2-5 |
+| S4-6 | Concurrency test: parallel holds on limited seats | B | 2h | S1-5 |
+| S4-7 | Thin React UI (event list + book ticket), cap at 6h | A | 6h | S3-4 |
+| S4-8 | Final report (≤2000 words) | Both | 8h | all |
+| S4-9 | README run instructions + repo polish | A | 2h | all |
 
-- One Dockerfile per service: slim Python base image, non-root user, dependencies installed from a pinned `requirements.txt`, gunicorn as the server.
-- `docker-compose.yml` runs all five services, PostgreSQL, and RabbitMQ with healthchecks and `depends_on` conditions. Monitoring can also run through Compose if Minikube resources are tight.
-- Kubernetes (Minikube): namespace, ConfigMap, Secret, Deployment + Service per service, PostgreSQL and RabbitMQ, nginx-ingress for path-based routing.
-- Readiness and liveness probes use each service's `/health/` endpoint.
-- Start Minikube with `--memory=4096 --cpus=2` as a baseline.
+## Key flows to demo (grading-friendly)
+1. **Happy path:** register -> login -> browse events -> book tickets -> payment succeeds -> booking `PAID` -> notification logged.
+2. **Payment failure:** payment-service failure mode on -> retries -> circuit opens -> booking stays `HELD` -> hold expires -> seats released.
+3. **Oversell protection:** k6 with hundreds of virtual users on a small seat count -> confirmed tickets never exceed capacity.
+4. **Alert:** stop a service -> Prometheus alert fires.
 
-## 7. CI/CD
+## Definition of Done (every task)
+- [ ] Code merged to `main` via reviewed PR (1 approval)
+- [ ] Tests pass in CI; new logic has a test
+- [ ] `docker compose up` still works
+- [ ] Docs/OpenAPI updated if the API changed
+- [ ] Issue closed with a one-line note on what was done
 
-GitHub Actions, triggered on pull requests and pushes to `main`:
+## Weekly rhythm
+- **Mon 15 min:** sprint planning — move issues to "Ready", confirm owners, rebalance
+- **Wed 10 min:** check-in — anything blocked? cut scope if needed
+- **Fri 20 min:** demo what works + retro (add a line to `docs/progress-log.md`)
+- **Review SLA:** PRs reviewed within 24h. Small PRs (<400 lines) only.
 
-1. Lint (ruff)
-2. Tests (pytest, matrix across the five services)
-3. Build Docker images
-4. Push images to GitHub Container Registry (GHCR) on `main`
-5. Optional manual deploy job (`kubectl apply`)
+## Scope guardrails
+- React is **not graded** — hard cap 6h total.
+- Minikube is heavy: if resources choke, run monitoring via compose and note the trade-off.
+- If a sprint slips, cut from S4 (frontend, extra alerts) — never from S2/S3 (45% of grade).
+- Reminder emails (S2-6) are optional; hold expiry is not.
 
-Branch protection on `main` requires the status checks to pass and one review approval.
-
-## 8. Monitoring and alerting
-
-- `django-prometheus` exposes `/metrics/` on every service.
-- Prometheus scrapes all services; Grafana shows request rate, latency, error rate, and service up/down.
-- Alert rules: service down (`up == 0`), high error rate, high CPU/memory. Alertmanager routes them; the service-down alert is verified by stopping a service.
-
-## 9. Testing
-
-- **Unit tests:** pytest + pytest-django, focus on payment logic (success, failure, simulated errors), booking status transitions and seat-hold expiry.
-- **Integration tests:** booking -> payment -> notification flow against the Compose stack.
-- **Resilience test:** payment failures trigger retries and then open the circuit breaker; held seats are released after expiry.
-- **Concurrency test:** many parallel bookings for a limited number of seats; assert that confirmed tickets never exceed capacity.
-- **Load test:** k6 script on the booking flow (e.g. hundreds of virtual users competing for the last tickets), with zero oversold seats as the headline result; results saved under `tests/load/results/`.
-
-## 10. Alternatives considered
-
-| Option | Decision | Reason |
+## Risk register
+| Risk | Impact | Mitigation |
 |---|---|---|
-| Node.js / Express | Not chosen | Prefer one language and framework across the team |
-| FastAPI | Not chosen | Faster per request, but Django gives auth, ORM, and migrations out of the box |
-| MongoDB for events | Deferred | Extra engine to run; PostgreSQL full-text search is enough now. Future improvement |
-| E-commerce, appointments or inventory domain | Not chosen | Ticketing adds a real concurrency problem (limited seats) that makes the load test and fault-tolerance demos meaningful |
-| Kafka | Not chosen | Heavier to run on Minikube; RabbitMQ meets the requirement |
-| gRPC | Not chosen | REST is simpler to document and demo with OpenAPI |
-| Istio / Kong | Not chosen | Too heavy for Minikube; nginx-ingress is sufficient |
-| Jenkins | Not chosen | GitHub Actions is integrated with the repo and needs no server |
+| Minikube RAM too small for 5 svc + PG + RMQ + monitoring | Part 4 blocked | Start `--memory=4096 --cpus=2`; deploy monitoring via compose if needed |
+| K8s/CI left too late | 30% of grade | Sprint 3 dedicated; compose works in S0 |
+| RabbitMQ wiring unclear (Celery consumer) | Part 3 blocked | Spike it early in S2 (S2-5 starts day 1) |
+| Seat hold race conditions or stuck holds | Core logic incorrect | Atomic DB update (D-006), expiry task (S2-6), concurrency test (S4-6) |
+| One teammate unavailable | Slipped sprint | Tasks are single-owner but documented; pair on S2-3 and S3-4 |
+| Secret committed by accident | Integrity/security | `.env` ignored + CI secret scan (`gitleaks`) optional |
+| Report written at the end from memory | Weak Part 6 | `progress-log.md` + `decisions.md` updated continuously |
 
-## 11. Future improvements
-
-- Separate PostgreSQL instance per service; MongoDB for the event catalog.
-- Redis-based seat holds and a virtual waiting room for very high-demand events.
-- Event recommendations based on past bookings (an AI-based extra service).
-- Outbox pattern for reliable event publishing.
-- Distributed tracing (OpenTelemetry + Jaeger).
-- API gateway with rate limiting.
-- Helm charts and automated deployment from CI.
+## GitHub mapping
+- **Milestones:** S0–S4 with due dates.
+- **Labels:** `part:1..6`, `svc:user|event|booking|payment|notification`, `type:feat|bug|chore|docs`, `blocked`.
+- **Assignees:** the Owner column above.
+- **Project board:** Backlog -> Ready -> In Progress -> Review -> Done.
