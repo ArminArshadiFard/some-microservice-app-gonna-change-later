@@ -27,7 +27,7 @@ Estimates are indicative; rebalance at each planning.
 
 ## Tasks
 
-Owner: **A** = Armin, **B** = teammate. (Swap freely; keep both touching infra.)
+Owner: **A** = Armin, **B** = Amir. Split by service ownership (see Ownership below); both of us touch infrastructure.
 
 ### S0 — Setup (3 days)
 | # | Task | Owner | Est | Depends |
@@ -50,6 +50,8 @@ Owner: **A** = Armin, **B** = teammate. (Swap freely; keep both touching infra.)
 | S1-5 | Event service: event + ticket-type CRUD, search, atomic seat hold/release, tests | B | 9h | S0-5 |
 | S1-6 | Part 1 deliverable assembled (diagram + contracts + schemas) | A | 1h | S1-1..3 |
 | S1-7 | `docs/report-outline.md` started | B | 1h | S1-6 |
+| S1-8 | Payment service stub: fixed-contract process endpoint (success/failure) so booking is never blocked | A | 2h | S0-4 |
+| S1-9 | K8s foundation on Minikube: namespace, ConfigMap, Secret, Postgres (5 DBs), RabbitMQ | A | 4h | S0-3 |
 
 ### S2 — Booking + Payment + Notification + fault tolerance (week 2)
 | # | Task | Owner | Est | Depends |
@@ -59,19 +61,20 @@ Owner: **A** = Armin, **B** = teammate. (Swap freely; keep both touching infra.)
 | S2-3 | tenacity retries + pybreaker on Booking -> Payment + failure demo test | B | 4h | S2-2 |
 | S2-4 | Booking publishes `booking.confirmed` to RabbitMQ | B | 2h | S2-2 |
 | S2-5 | Notification: Celery worker, queue consumer, console email, tests | A | 8h | S0-3 |
-| S2-6 | Celery beat task: expire holds, release seats, send event reminders | A | 3h | S2-2, S2-5 |
+| S2-6 | Celery beat task in booking-service: expire holds, release seats in event-service | B | 3h | S2-2 |
 | S2-7 | Part 3 report (communication strategy) | A | 2h | S2-3, S2-5 |
-| S2-8 | Export OpenAPI YAMLs to `docs/openapi/` (CI step) | A | 1h | S1-4, S1-5 |
+| S2-8 | Export OpenAPI YAMLs to `docs/openapi/` (CI step) | B | 1h | S1-4, S1-5, S0-6 |
+| S2-9 | Event reminder job in notification-service (optional) | A | 1h | S2-5 |
 
 ### S3 — Docker + K8s + CI/CD (week 3)
 | # | Task | Owner | Est | Depends |
 |---|---|---|---|---|
 | S3-1 | Finalize Dockerfiles + compose healthchecks + env wiring | A | 2h | S2 |
-| S3-2 | K8s: namespace, ConfigMap, Secret, 5 Deployments + Services | B | 6h | S3-1 |
-| S3-3 | Postgres + RabbitMQ in K8s | B | 3h | S3-2 |
-| S3-4 | nginx-ingress, path-based routing, verify all services | B | 3h | S3-3 |
-| S3-5 | CI: test matrix -> build -> push to GHCR | A | 5h | S0-6 |
-| S3-6 | Optional deploy job (`kubectl apply`, manual trigger) | A | 3h | S3-5, S3-4 |
+| S3-2 | K8s: 5 Deployments + Services (probes, resource limits) on top of the S1-9 foundation | A | 6h | S3-1, S1-9 |
+| S3-3 | Verify Postgres + RabbitMQ in K8s with the real services; fix wiring (built in S1-9) | A | 1h | S3-2 |
+| S3-4 | nginx-ingress, path-based routing, verify all services | A | 3h | S3-3 |
+| S3-5 | CI: test matrix -> build -> push to GHCR | B | 5h | S0-6 |
+| S3-6 | Optional deploy job (`kubectl apply`, manual trigger) | B | 3h | S3-5, S3-4 |
 | S3-7 | Demo video (Part 4) | Both | 2h | S3-4 |
 | S3-8 | `docs/demo-video-script.md` | A | 0.5h | — |
 
@@ -84,9 +87,23 @@ Owner: **A** = Armin, **B** = teammate. (Swap freely; keep both touching infra.)
 | S4-4 | k6 load test: many users competing for limited seats; assert no oversold seats | B | 4h | S3-4 |
 | S4-5 | Integration tests: booking -> payment -> notification | B | 3h | S2-5 |
 | S4-6 | Concurrency test: parallel holds on limited seats | B | 2h | S1-5 |
-| S4-7 | Thin React UI (event list + book ticket), cap at 6h | A | 6h | S3-4 |
+| S4-7 | Thin React UI (event list + book ticket), cap at 6h; can start once APIs are stable | B | 6h | S3-4 |
 | S4-8 | Final report (≤2000 words) | Both | 8h | all |
 | S4-9 | README run instructions + repo polish | A | 2h | all |
+
+## Ownership
+
+| Area | Armin (A) | Amir (B) |
+|---|---|---|
+| Services | user, payment, notification | event, booking |
+| Containers and cluster | Compose, Dockerfiles, all Kubernetes (`deploy/k8s`), ingress | — |
+| Pipeline and tests | — | CI/CD (`.github`), GHCR, OpenAPI export, integration, concurrency and k6 tests |
+| Monitoring | Prometheus, Grafana (`deploy/monitoring`) | Alertmanager rule |
+| Frontend | — | React UI (capped at 6h) |
+| Docs | Architecture diagram, Part 1 assembly, Part 3 report, README | API contracts, ERDs, report outline |
+| Shared | Final report, demo video, decisions log | Final report, demo video, decisions log |
+
+Cross-service interfaces (agree first, change only by `contract` PR): JWT claims, payment API, `booking.confirmed` message.
 
 ## Key flows to demo (grading-friendly)
 1. **Happy path:** register -> login -> browse events -> book tickets -> payment succeeds -> booking `PAID` -> notification logged.

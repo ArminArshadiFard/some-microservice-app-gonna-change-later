@@ -91,6 +91,13 @@ Short record of design and implementation decisions. One entry per decision, new
 - **Alternatives:** No UI, Swagger UI only.
 - **Consequences:** Cut first if any sprint slips.
 
+## D-013: Work is split by service ownership
+- **Status:** Accepted
+- **Context:** Two people, five services, four weeks. Interleaved tasks create handoffs and blocked work.
+- **Decision:** Armin owns user, payment and notification services plus Docker, Kubernetes and monitoring; Amir owns event and booking services plus CI/CD, tests and the React UI. Only three interfaces cross between us: JWT claims, the payment API and the `booking.confirmed` message, all fixed in `conventions.md`. Payment-service gets an early stub so booking is never blocked. `CODEOWNERS` routes reviews; each of us reviews the other's PRs.
+- **Alternatives:** Split by task type (backend/infra), interleaved task lists.
+- **Consequences:** Few dependencies and clear accountability. Either of us can read and take over the other's services because each has a documented contract.
+
 ---
 
 ## Template for new entries

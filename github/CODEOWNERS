@@ -1,0 +1,17 @@
+# Default: both review
+*                                   @ArminArshadiFard @Amir
+
+/services/user-service/             @ArminArshadiFard
+/services/payment-service/          @ArminArshadiFard
+/services/notification-service/     @ArminArshadiFard
+/services/event-service/            @Amir
+/services/booking-service/          @Amir
+
+/deploy/k8s/                        @ArminArshadiFard
+/deploy/monitoring/                 @ArminArshadiFard
+
+/.github/                           @Amir
+/frontend/                          @Amir
+/tests/                             @Amir
+
+/docs/conventions.md                @ArminArshadiFard @Amir
