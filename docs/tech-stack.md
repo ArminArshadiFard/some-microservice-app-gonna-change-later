@@ -1,83 +1,135 @@
 # Tech Stack
 
-> Living document. Update when a version or choice changes.
-> How-to conventions: `docs/conventions.md`. Rationale for debatable picks: `docs/decisions.md`.
+This document records the technology choices for the event ticketing platform (users browse events and book tickets) and the reasoning behind each one. The assignment allows a "similar domain" to e-commerce; the five required service roles map as follows: Product = event-service, Order = booking-service, with User, Payment and Notification unchanged. It covers the "Tech Stack Selection" and "Database Design" requirements of Part 1. Day-to-day decisions that change over time go in `decisions.md`.
 
-## Architecture in one line
-Five independent Django/DRF services, each owning one PostgreSQL database,
-communicating via REST (sync) and RabbitMQ (async), containerized and deployed to Minikube.
+## 1. Summary
 
-## Core stack
+| Layer | Choice | Why (one line) |
+|---|---|---|
+| Language | Python 3.12 | One language across all services; fast to build and test |
+| API framework | Django 5 + Django REST Framework | Mature auth, ORM, migrations, admin; DRF gives serializers and viewsets |
+| API docs | drf-spectacular | Generates OpenAPI 3 + Swagger UI from the code, so docs never drift |
+| Auth | JWT via `djangorestframework-simplejwt` | Stateless, works across services without a shared session store |
+| Databases | PostgreSQL 16 (one database per service) | Relational integrity for users, bookings, payments |
+| Message broker | RabbitMQ | Simple, reliable queues; good fit for Booking -> Notification |
+| Async workers | Celery (+ Celery beat) | Consumes RabbitMQ events; runs the hold-expiry and reminder jobs |
+| Sync HTTP client | httpx | Timeouts, connection pooling, easy to mock in tests |
+| Retries | tenacity | Declarative retry with exponential backoff |
+| Circuit breaker | pybreaker | Python equivalent of Resilience4j |
+| Containers | Docker + Docker Compose | Local reproducible environment |
+| Orchestration | Kubernetes (Minikube) + nginx-ingress | Matches the assignment; path-based routing |
+| CI/CD | GitHub Actions + GHCR | Same place as the repo; free for this scale |
+| Metrics | Prometheus + django-prometheus | Per-service `/metrics/` with almost no code |
+| Dashboards | Grafana | Required screenshot deliverable |
+| Alerts | Prometheus alert rules + Alertmanager | Service-down and high-resource alerts |
+| Unit/integration tests | pytest + pytest-django | Fast, readable, good fixtures |
+| Load testing | k6 | Scriptable, simple results output |
+| Lint/format | ruff | One fast tool for lint and format |
+| Frontend (optional, not graded) | React + Vite | Thin UI only, capped at 6h |
 
-| Concern | Choice | Version | Rationale |
+## 2. Services and ownership of data
+
+Each service is self-contained and owns its own database. No service reads another service's tables.
+
+| Service | Responsibility | Database | Notes |
 |---|---|---|---|
-| Language (backend) | Python | 3.12 | Pinned in all Dockerfiles |
-| Backend framework | Django | 5.0.x | Part 2 services |
-| API framework | Django REST Framework | 3.15.x | Part 2 |
-| API style | REST (not gRPC) | — | Simpler in Django; ADR D1 |
-| API docs | drf-spectacular | latest | Auto Swagger → Part 1 & 2 deliverables |
-| Auth | djangorestframework-simplejwt | latest | JWT; HS256 shared secret |
-| DB driver | psycopg[binary] | 3.x | Postgres 16 |
-| WSGI server | gunicorn | latest | Prod-style serving in containers |
-| CORS | django-cors-headers | latest | React dev origin |
-| Database | PostgreSQL | 16-alpine | One DB per service |
-| Message queue | RabbitMQ | 3-management | Part 3 async |
-| Async worker | Celery | 5.x | Notification consumer |
-| HTTP client (svc→svc) | httpx | latest | Order → Payment |
-| Retries | tenacity | latest | Part 3 |
-| Circuit breaker | pybreaker | latest | Part 3; ADR D2 |
+| user-service | Register, login, JWT issue, profile (attendee or organizer role) | `users_db` (PostgreSQL) | Passwords hashed with Django's PBKDF2 (or Argon2) |
+| event-service | Event and ticket-type CRUD, search, seat availability | `events_db` (PostgreSQL) | Search via indexed `ILIKE` / PostgreSQL full-text search; atomic seat holds |
+| booking-service | Create, track and cancel bookings; hold and expiry logic | `bookings_db` (PostgreSQL) | Statuses `HELD`, `PAID`, `EXPIRED`, `CANCELLED`; calls payment-service; publishes `booking.confirmed` |
+| payment-service | Simulated payments, failure simulation | `payments_db` (PostgreSQL) | Configurable failure rate for demos and tests |
+| notification-service | Consume events, send email (console) | `notifications_db` (PostgreSQL) | Booking confirmation and event reminders; logs sent notifications |
 
-## Observability
+### Database choice rationale
 
-| Concern | Choice | Notes |
+- **PostgreSQL everywhere** keeps operations simple: one engine to run in Compose and Kubernetes, one backup story, one set of skills.
+- Bookings, payments and seat counts need transactions and constraints, which favors SQL. Overselling is prevented in event-service with an atomic update (`UPDATE ... SET available = available - n WHERE available >= n`) or `SELECT ... FOR UPDATE` inside a transaction.
+- Event search is covered by PostgreSQL full-text search at this scale.
+- Deployment: **one PostgreSQL instance with five separate databases and five separate users**, each service holding credentials only for its own database. This keeps Minikube memory low while still enforcing data isolation. In production each service would get its own instance.
+- The assignment suggests MongoDB for the catalog service as an example only. We note it as a future improvement for events with flexible attributes (see section 10).
+
+## 3. Inter-service communication
+
+| Path | Style | Technology |
 |---|---|---|
-| App metrics | django-prometheus | `/metrics/` on every service |
-| Metrics store | Prometheus | Scrapes all services |
-| Dashboards | Grafana | One dashboard, committed as JSON |
-| Alerting | Alertmanager | ≥1 rule (service down, error rate) |
+| Client -> services | Synchronous REST | nginx-ingress, path-based routing (`/api/users`, `/api/events`, `/api/bookings`, ...) |
+| Booking -> Event | Synchronous REST | Hold seats before payment; release them on failure or expiry |
+| Booking -> Payment | Synchronous REST | httpx + tenacity retries + pybreaker circuit breaker |
+| Booking -> Notification | Asynchronous events | RabbitMQ queue (`booking.confirmed`), Celery consumer |
 
-## Frontend
-| Concern | Choice | Notes |
+Why this split: the seat hold and the payment result decide the booking status, so both are synchronous. Notification must never block or fail a booking, so it is asynchronous.
+
+REST was chosen over gRPC because it is simpler to document with OpenAPI, easy to test with curl and Swagger UI, and sufficient for the traffic here.
+
+## 4. Fault tolerance
+
+- **Timeouts:** every outbound call has an explicit timeout (no default infinite waits).
+- **Retries:** tenacity, exponential backoff with jitter, limited attempts, only on transient errors (timeouts, 5xx), never on 4xx.
+- **Circuit breaker:** pybreaker on Booking -> Payment; opens after N consecutive failures, half-opens after a cool-down.
+- **Fallback:** when the circuit is open, the booking stays `HELD` and a clear "payment temporarily unavailable" response is returned. The seat hold expires after a fixed time (e.g. 10 minutes); a Celery beat task marks the booking `EXPIRED` and releases the seats in event-service, so no seats are lost to failures.
+- **Failure simulation:** payment-service exposes a configurable failure mode so the circuit breaker can be demonstrated on demand.
+- Note: Resilience4j is a Java library and Istio is a service mesh; tenacity + pybreaker is the equivalent at application level for Python.
+
+## 5. Authentication and security
+
+- user-service issues short-lived JWT access tokens plus refresh tokens.
+- Other services validate tokens locally using the shared signing configuration (injected via Kubernetes Secret), so there is no call to user-service per request.
+- Secrets live in `.env` (git-ignored) locally and in Kubernetes Secrets in the cluster; `.env.example` is committed.
+- Passwords are never stored in plain text; input validation through DRF serializers.
+- Optional secret scanning in CI with gitleaks.
+
+## 6. Containerization and orchestration
+
+- One Dockerfile per service: slim Python base image, non-root user, dependencies installed from a pinned `requirements.txt`, gunicorn as the server.
+- `docker-compose.yml` runs all five services, PostgreSQL, and RabbitMQ with healthchecks and `depends_on` conditions. Monitoring can also run through Compose if Minikube resources are tight.
+- Kubernetes (Minikube): namespace, ConfigMap, Secret, Deployment + Service per service, PostgreSQL and RabbitMQ, nginx-ingress for path-based routing.
+- Readiness and liveness probes use each service's `/health/` endpoint.
+- Start Minikube with `--memory=4096 --cpus=2` as a baseline.
+
+## 7. CI/CD
+
+GitHub Actions, triggered on pull requests and pushes to `main`:
+
+1. Lint (ruff)
+2. Tests (pytest, matrix across the five services)
+3. Build Docker images
+4. Push images to GitHub Container Registry (GHCR) on `main`
+5. Optional manual deploy job (`kubectl apply`)
+
+Branch protection on `main` requires the status checks to pass and one review approval.
+
+## 8. Monitoring and alerting
+
+- `django-prometheus` exposes `/metrics/` on every service.
+- Prometheus scrapes all services; Grafana shows request rate, latency, error rate, and service up/down.
+- Alert rules: service down (`up == 0`), high error rate, high CPU/memory. Alertmanager routes them; the service-down alert is verified by stopping a service.
+
+## 9. Testing
+
+- **Unit tests:** pytest + pytest-django, focus on payment logic (success, failure, simulated errors), booking status transitions and seat-hold expiry.
+- **Integration tests:** booking -> payment -> notification flow against the Compose stack.
+- **Resilience test:** payment failures trigger retries and then open the circuit breaker; held seats are released after expiry.
+- **Concurrency test:** many parallel bookings for a limited number of seats; assert that confirmed tickets never exceed capacity.
+- **Load test:** k6 script on the booking flow (e.g. hundreds of virtual users competing for the last tickets), with zero oversold seats as the headline result; results saved under `tests/load/results/`.
+
+## 10. Alternatives considered
+
+| Option | Decision | Reason |
 |---|---|---|
-| Language | Node.js 20 | Dev + build |
-| Framework | React 18 + Vite 5 | Thin demo (not graded) |
-| HTTP | native `fetch` | No state library |
+| Node.js / Express | Not chosen | Prefer one language and framework across the team |
+| FastAPI | Not chosen | Faster per request, but Django gives auth, ORM, and migrations out of the box |
+| MongoDB for events | Deferred | Extra engine to run; PostgreSQL full-text search is enough now. Future improvement |
+| E-commerce, appointments or inventory domain | Not chosen | Ticketing adds a real concurrency problem (limited seats) that makes the load test and fault-tolerance demos meaningful |
+| Kafka | Not chosen | Heavier to run on Minikube; RabbitMQ meets the requirement |
+| gRPC | Not chosen | REST is simpler to document and demo with OpenAPI |
+| Istio / Kong | Not chosen | Too heavy for Minikube; nginx-ingress is sufficient |
+| Jenkins | Not chosen | GitHub Actions is integrated with the repo and needs no server |
 
-## Delivery & ops
+## 11. Future improvements
 
-| Concern | Choice | Notes |
-|---|---|---|
-| Containers | Docker | Dockerfile per service |
-| Local orchestration | docker-compose | Postgres + RabbitMQ + 5 services |
-| Orchestration | Minikube + nginx-ingress | Path-based routing |
-| Registry | GHCR (`ghcr.io/<owner>/<svc>`) | Tags: `:<git-sha>` + `:latest` |
-| CI/CD | GitHub Actions | lint → test → build → push → deploy (manual apply) |
-| Load testing | k6 | Order flow scenario |
-| Tests | pytest, pytest-django, pytest-cov, DRF APIClient | Unit + integration |
-| Lint/format | ruff | CI-enforced |
-
-## Environments
-
-| Concern | Local (runserver) | Compose | Minikube |
-|---|---|---|---|
-| Config source | `.env` | `.env` + `environment:` | ConfigMap + Secret |
-| DB host | `localhost:5432` | `postgres:5432` | `postgres.<ns>.svc` |
-| Broker | `localhost:5672` | `rabbitmq:5672` | `rabbitmq.<ns>.svc` |
-| API docs | on | on | on |
-| CORS | allow-all | allow-all | allow-all (dev) |
-| `DEBUG` | True | True | False |
-
-## Version pinning policy
-Exact versions live in `services/*/requirements.txt`, Dockerfiles (`python:3.12-slim`),
-and `frontend/package.json`. This document records intent, not exact pins.
-
-## Security baseline
-- Secrets never committed; `.env.example` only.
-- `JWT_SECRET` shared across services via env/Secret.
-- K8s: DB password + JWT secret in `Secret`; non-secret config in `ConfigMap`.
-- `DEBUG=False` and explicit `ALLOWED_HOSTS` on Minikube.
-- Service-to-service calls forward the user's JWT (ADR D3).
-
-## Out of scope / future improvements
-Refresh-token rotation, RS256, distributed tracing (OpenTelemetry), per-service Postgres
-instances, HPA/autoscaling, GitOps (ArgoCD), gRPC, service mesh.
+- Separate PostgreSQL instance per service; MongoDB for the event catalog.
+- Redis-based seat holds and a virtual waiting room for very high-demand events.
+- Event recommendations based on past bookings (an AI-based extra service).
+- Outbox pattern for reliable event publishing.
+- Distributed tracing (OpenTelemetry + Jaeger).
+- API gateway with rate limiting.
+- Helm charts and automated deployment from CI.
